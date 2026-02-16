@@ -8,7 +8,10 @@
 
 핵심 기술 스택:
     - PyMuPDF (fitz): 좌표 기반 텍스트 블록 추출
-    - PaddleOCR: 이미지형 PDF / 인코딩 깨짐 시 한국어·영어·수식·숫자 OCR
+    - RapidOCR (ONNX Runtime): 한국어·영어·수식·숫자 OCR
+      - CUDA 서버: CUDAExecutionProvider
+      - Mac (Apple Silicon): CoreMLExecutionProvider (GPU/ANE 가속)
+      - 폴백: CPUExecutionProvider
     - LangChain RecursiveCharacterTextSplitter: RAG 최적화 청킹
 """
 
@@ -17,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import io
 import logging
+import platform
 import re
 import statistics
 import unicodedata
@@ -30,7 +34,6 @@ from typing import Any, Optional, Sequence
 import fitz  # PyMuPDF
 import numpy as np
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from paddleocr import PaddleOCR
 from PIL import Image
 
 # ---------------------------------------------------------------------------
@@ -85,7 +88,7 @@ class ChunkMetadata:
     extraction_timestamp: str
     chunk_index: int = 0
     sha256: str = ""
-    extraction_method: str = "pymupdf"  # "pymupdf" | "paddleocr"
+    extraction_method: str = "pymupdf"  # "pymupdf" | "rapidocr"
 
 
 @dataclass
@@ -97,12 +100,65 @@ class ProcessedChunk:
 
 
 # ---------------------------------------------------------------------------
+# 실행 환경 자동 감지
+# ---------------------------------------------------------------------------
+def _detect_onnx_providers() -> list[tuple[str, dict] | str]:
+    """현재 환경에 최적화된 ONNX Runtime ExecutionProvider 목록을 반환한다.
+
+    감지 우선순위:
+        1) NVIDIA CUDA → CUDAExecutionProvider
+        2) macOS (Apple Silicon) → CoreMLExecutionProvider
+        3) 폴백 → CPUExecutionProvider
+
+    Returns:
+        onnxruntime.InferenceSession에 전달할 providers 리스트.
+    """
+    import onnxruntime as ort
+
+    available = ort.get_available_providers()
+    providers: list[tuple[str, dict] | str] = []
+
+    # 1) CUDA
+    if "CUDAExecutionProvider" in available:
+        providers.append(
+            (
+                "CUDAExecutionProvider",
+                {
+                    "device_id": 0,
+                    "arena_extend_strategy": "kNextPowerOfTwo",
+                    "cudnn_conv_algo_search": "EXHAUSTIVE",
+                },
+            )
+        )
+        logger.info("ONNX Runtime: CUDAExecutionProvider 감지")
+
+    # 2) CoreML (macOS)
+    if "CoreMLExecutionProvider" in available and platform.system() == "Darwin":
+        providers.append(
+            (
+                "CoreMLExecutionProvider",
+                {
+                    "ModelFormat": "MLProgram",
+                    "MLComputeUnits": "ALL",  # CPU + GPU + ANE
+                    "RequireStaticInputShapes": "0",
+                },
+            )
+        )
+        logger.info("ONNX Runtime: CoreMLExecutionProvider 감지 (Apple Silicon)")
+
+    # 3) CPU 폴백 (항상 마지막)
+    providers.append("CPUExecutionProvider")
+
+    return providers
+
+
+# ---------------------------------------------------------------------------
 # OCR Fallback 추상 인터페이스
 # ---------------------------------------------------------------------------
 class OCREngineBase(ABC):
     """OCR 엔진의 추상 인터페이스.
 
-    PaddleOCR 외에 Tesseract, Google Vision 등으로 교체할 수 있도록
+    RapidOCR 외에 Tesseract, Google Vision 등으로 교체할 수 있도록
     추상 메서드 기반 설계.
     """
 
@@ -122,40 +178,155 @@ class OCREngineBase(ABC):
         ...
 
 
-class PaddleOCREngine(OCREngineBase):
-    """PaddleOCR 기반 한국어·영어·수식·숫자 인식 엔진.
+class RapidOCREngine(OCREngineBase):
+    """RapidOCR 기반 한국어·영어·수식·숫자 인식 엔진.
+
+    PaddleOCR의 PP-OCRv4/v5 모델을 ONNX로 변환하여
+    onnxruntime으로 구동한다. PaddlePaddle 프레임워크 의존성 없이
+    CUDA / CoreML(Mac) / CPU 가속을 지원한다.
+
+    환경별 가속:
+        - NVIDIA GPU 서버 → CUDAExecutionProvider (RTX 3090 등)
+        - Apple Silicon Mac → CoreMLExecutionProvider (GPU + ANE)
+        - 기타 → CPUExecutionProvider
 
     Attributes:
-        _ocr: PaddleOCR 인스턴스 (lazy init).
+        _engine: RapidOCR 인스턴스 (lazy init).
+        _use_cuda: CUDA 사용 여부.
+        _use_coreml: CoreML 사용 여부.
     """
 
-    def __init__(self) -> None:
-        self._ocr: Optional[PaddleOCR] = None
+    def __init__(
+        self,
+        use_cuda: Optional[bool] = None,
+        use_coreml: Optional[bool] = None,
+    ) -> None:
+        """RapidOCREngine을 초기화한다.
 
-    def _get_ocr(self) -> PaddleOCR:
-        """PaddleOCR 인스턴스를 지연 초기화한다.
-
-        한국어(korean) + 영어를 동시 인식하도록 설정.
-        수식과 숫자는 기본 모델이 처리.
+        Args:
+            use_cuda: CUDA 강제 사용 여부. None이면 자동 감지.
+            use_coreml: CoreML 강제 사용 여부. None이면 자동 감지.
         """
-        if self._ocr is None:
-            self._ocr = PaddleOCR(
-                use_angle_cls=True,
-                lang="korean",
-                use_gpu=True,
-                show_log=False,
-                # 수식/숫자 인식 정확도 향상을 위한 파라미터
-                det_db_thresh=0.3,
-                det_db_box_thresh=0.5,
-                rec_batch_num=16,
+        self._engine = None
+        self._use_cuda = use_cuda
+        self._use_coreml = use_coreml
+
+    def _get_engine(self):
+        """RapidOCR 인스턴스를 지연 초기화한다.
+
+        환경을 자동 감지하여 최적의 ExecutionProvider를 선택하고,
+        한국어 인식 모델(PP-OCRv4)로 구성한다.
+
+        Returns:
+            초기화된 RapidOCR 인스턴스.
+        """
+        if self._engine is not None:
+            return self._engine
+
+        from rapidocr import RapidOCR
+
+        # 환경 자동 감지
+        if self._use_cuda is None and self._use_coreml is None:
+            import onnxruntime as ort
+
+            available = ort.get_available_providers()
+            self._use_cuda = "CUDAExecutionProvider" in available
+            self._use_coreml = (
+                "CoreMLExecutionProvider" in available
+                and platform.system() == "Darwin"
             )
-            logger.info("PaddleOCR 엔진 초기화 완료 (lang=korean)")
-        return self._ocr
+
+        params: dict[str, Any] = {
+            # 한국어 인식 모델
+            "Rec.lang_type": "korean",
+            "Rec.engine_type": "onnxruntime",
+            "Rec.model_type": "mobile",
+            "Rec.ocr_version": "PP-OCRv4",
+            # 검출 모델 (CJK 공용)
+            "Det.engine_type": "onnxruntime",
+            "Det.model_type": "mobile",
+            "Det.ocr_version": "PP-OCRv4",
+            # 방향 분류
+            "Cls.engine_type": "onnxruntime",
+            # 검출 파라미터 — 보험 문서 최적화
+            "Det.thresh": 0.3,
+            "Det.box_thresh": 0.5,
+            "Det.unclip_ratio": 1.6,
+            # 인식 배치
+            "Rec.rec_batch_num": 16,
+        }
+
+        # GPU 가속 설정
+        if self._use_cuda:
+            params["EngineConfig.onnxruntime.use_cuda"] = True
+            params["EngineConfig.onnxruntime.cuda_ep_cfg.device_id"] = 0
+            logger.info("RapidOCR: CUDA 가속 활성화")
+        else:
+            params["EngineConfig.onnxruntime.use_cuda"] = False
+            if self._use_coreml:
+                logger.info("RapidOCR: CoreML 가속 활성화 (Apple Silicon)")
+            else:
+                logger.info("RapidOCR: CPU 모드")
+
+        self._engine = RapidOCR(params=params)
+
+        # CoreML: RapidOCR 네이티브 지원이 없으므로 세션을 수동 교체
+        if self._use_coreml and not self._use_cuda:
+            self._patch_coreml_sessions()
+
+        logger.info(
+            "RapidOCR 엔진 초기화 완료 (lang=korean, ocr_version=PP-OCRv4)"
+        )
+        return self._engine
+
+    def _patch_coreml_sessions(self) -> None:
+        """RapidOCR 내부 ONNX 세션을 CoreMLExecutionProvider로 교체한다.
+
+        RapidOCR v3.x는 CoreML EP를 네이티브로 지원하지 않지만,
+        내부 InferenceSession을 사후 교체하여 Apple Silicon
+        GPU/ANE 가속을 활용할 수 있다.
+        """
+        import onnxruntime as ort
+
+        providers = _detect_onnx_providers()
+
+        try:
+            # RapidOCR 내부 파이프라인의 각 모듈에서 세션 교체 시도
+            pipeline = self._engine
+            for attr_name in ("text_det", "text_cls", "text_rec"):
+                module = getattr(pipeline, attr_name, None)
+                if module is None:
+                    continue
+                # 추론 엔진 내부의 session 접근
+                infer = getattr(module, "infer", None) or getattr(
+                    module, "predictor", None
+                )
+                if infer is None:
+                    continue
+                session = getattr(infer, "session", None)
+                if session is None:
+                    continue
+                # 기존 세션의 모델 경로로 CoreML 세션 재생성
+                model_path = session.get_modelmeta().graph_name
+                # 모델 파일 경로 추출 시도
+                model_file = getattr(infer, "model_path", None)
+                if model_file and Path(model_file).exists():
+                    new_session = ort.InferenceSession(
+                        str(model_file), providers=providers
+                    )
+                    infer.session = new_session
+                    logger.debug(
+                        "CoreML 세션 교체 완료: %s", attr_name
+                    )
+        except Exception as e:
+            logger.warning(
+                "CoreML 세션 교체 실패 (CPU 폴백 유지): %s", e
+            )
 
     def extract_text_from_image(
         self, image: Image.Image, lang: str = "korean"
     ) -> list[TextBlock]:
-        """PIL Image에서 PaddleOCR로 텍스트를 추출한다.
+        """PIL Image에서 RapidOCR로 텍스트를 추출한다.
 
         Args:
             image: PIL Image 객체 (페이지 렌더링 결과).
@@ -165,40 +336,37 @@ class PaddleOCREngine(OCREngineBase):
             좌표 정보 포함 TextBlock 리스트.
             인식 실패 시 빈 리스트.
         """
-        ocr = self._get_ocr()
+        engine = self._get_engine()
         img_array = np.array(image)
 
         try:
-            results = ocr.ocr(img_array, cls=True)
+            result = engine(img_array)
         except Exception as e:
-            logger.error("PaddleOCR 인식 실패: %s", e)
+            logger.error("RapidOCR 인식 실패: %s", e)
             return []
 
         blocks: list[TextBlock] = []
-        if not results or not results[0]:
+
+        # RapidOCR v3.x 출력: result.boxes (N,4,2), result.txts, result.scores
+        if result.boxes is None or result.txts is None:
             return blocks
 
-        for line in results[0]:
-            bbox_points = line[0]  # [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
-            text_info = line[1]    # (text, confidence)
-
-            text = text_info[0]
-            confidence = text_info[1]
-
-            if confidence < 0.5:
+        for box, txt, score in zip(result.boxes, result.txts, result.scores):
+            if score < 0.5:
                 continue
 
-            # 4점 좌표 → 바운딩 박스
-            xs = [p[0] for p in bbox_points]
-            ys = [p[1] for p in bbox_points]
+            # 4점 좌표 (N,4,2) → 바운딩 박스 (x0,y0,x1,y1)
+            # box: [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
+            xs = box[:, 0]
+            ys = box[:, 1]
 
             blocks.append(
                 TextBlock(
-                    x0=min(xs),
-                    y0=min(ys),
-                    x1=max(xs),
-                    y1=max(ys),
-                    text=text.strip(),
+                    x0=float(np.min(xs)),
+                    y0=float(np.min(ys)),
+                    x1=float(np.max(xs)),
+                    y1=float(np.max(ys)),
+                    text=txt.strip(),
                 )
             )
 
@@ -231,7 +399,7 @@ class InsurancePDFProcessor:
         min_chunk_length: 유효 청크 최소 문자 수.
         garbage_symbol_ratio: 가비지 판별 기호 비율 임계값.
         y_tolerance: 같은 행 판별 Y좌표 허용 오차 (pt).
-        ocr_engine: OCR 엔진 인스턴스 (None이면 PaddleOCR 사용).
+        ocr_engine: OCR 엔진 인스턴스 (None이면 RapidOCR 자동 감지).
         ocr_dpi: OCR 렌더링 DPI.
         table_separator: 표 내부 셀 구분자.
     """
@@ -285,7 +453,7 @@ class InsurancePDFProcessor:
         self.min_chunk_length = min_chunk_length
         self.garbage_symbol_ratio = garbage_symbol_ratio
         self.y_tolerance = y_tolerance
-        self.ocr_engine: OCREngineBase = ocr_engine or PaddleOCREngine()
+        self.ocr_engine: OCREngineBase = ocr_engine or RapidOCREngine()
         self.ocr_dpi = ocr_dpi
         self.table_separator = table_separator
 
@@ -504,7 +672,7 @@ class InsurancePDFProcessor:
     def _extract_blocks_ocr(
         self, page: fitz.Page, content_bbox: BoundingBox
     ) -> list[TextBlock]:
-        """OCR 폴백: 페이지를 이미지로 렌더링 후 PaddleOCR로 텍스트를 추출한다.
+        """OCR 폴백: 페이지를 이미지로 렌더링 후 RapidOCR로 텍스트를 추출한다.
 
         이미지형 PDF 또는 텍스트 추출이 실패한 페이지에 대해 호출.
         렌더링 DPI는 self.ocr_dpi를 따른다.
@@ -837,7 +1005,7 @@ class InsurancePDFProcessor:
             )
             try:
                 blocks = self._extract_blocks_ocr(page, content_bbox)
-                extraction_method = "paddleocr"
+                extraction_method = "rapidocr"
             except Exception as e:
                 logger.error("p%d: OCR 폴백 실패: %s", page_num + 1, e)
                 if not blocks:
@@ -857,12 +1025,7 @@ class InsurancePDFProcessor:
             text = block.text
             text = self._normalize_unicode(text)
             text = self._clean_text_safe(text)
-
-            if block.block_type == "table":
-                # 표는 줄바꿈으로 구분하여 청킹 시 분리 가능하게
-                page_text_parts.append(text)
-            else:
-                page_text_parts.append(text)
+            page_text_parts.append(text)
 
         # 문장 병합 (표가 아닌 일반 텍스트에 대해)
         full_text = "\n".join(page_text_parts)

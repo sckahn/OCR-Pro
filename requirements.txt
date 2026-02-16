@@ -1,6 +1,7 @@
 PyMuPDF>=1.24.0
-paddleocr>=2.7.0
-paddlepaddle-gpu>=3.0.0  # CUDA 11.8: pip install -i https://www.paddlepaddle.org.cn/packages/stable/cu118/
+rapidocr>=3.6.0
+onnxruntime>=1.18.0       # CPU + CoreML (Mac)
+# onnxruntime-gpu>=1.18.0  # CUDA 서버에서는 이 줄로 교체
 langchain>=0.2.0
 langchain-text-splitters>=0.2.0
 Pillow>=10.0.0
